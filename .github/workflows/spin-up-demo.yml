@@ -1,0 +1,149 @@
+name: Spin up Demo (Docker + ngrok)
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_minutes:
+        description: "How long to keep the tunnels alive"
+        required: true
+        default: "20"
+      seed_demo:
+        description: "Seed some demo inventory updates?"
+        type: boolean
+        default: true
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    env:
+      # ---- App env (map these to your own needs) ----
+      SHOPIFY_API_KEY: ${{ secrets.SHOPIFY_API_KEY }}
+      SHOPIFY_PASSWORD: ${{ secrets.SHOPIFY_PASSWORD }}
+      SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+      SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+      SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+      # any BC365 or DB vars you use in docker-compose:
+      BC365_BASE_URL: ${{ secrets.BC365_BASE_URL }}
+      BC365_USERNAME: ${{ secrets.BC365_USERNAME }}
+      BC365_PASSWORD: ${{ secrets.BC365_PASSWORD }}
+
+      # ---- ngrok ----
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker version
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Build & start stack (app + monitoring)
+        run: |
+          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml up -d --build
+          echo "Waiting for API health..."
+          for i in {1..60}; do
+            curl -fsS http://localhost:8000/health && break || true
+            sleep 3
+          done
+          echo "Containers:"
+          docker compose ps
+
+      # --- Start ngrok tunnels (one step per tunnel, backgrounded) ---
+      - name: Start ngrok (API :8000)
+        id: ngrok_api
+        uses: ngrok/ngrok-action@v2
+        with:
+          authtoken: ${{ env.NGROK_AUTHTOKEN }}
+          addr: http://localhost:8000
+          proto: http
+          background: true
+
+      - name: Start ngrok (Grafana :3000)
+        id: ngrok_grafana
+        uses: ngrok/ngrok-action@v2
+        with:
+          authtoken: ${{ env.NGROK_AUTHTOKEN }}
+          addr: http://localhost:3000
+          proto: http
+          background: true
+
+      - name: Start ngrok (Prometheus :9090)
+        id: ngrok_prom
+        uses: ngrok/ngrok-action@v2
+        with:
+          authtoken: ${{ env.NGROK_AUTHTOKEN }}
+          addr: http://localhost:9090
+          proto: http
+          background: true
+
+      - name: Show public URLs
+        run: |
+          echo "### Public URLs" >> $GITHUB_STEP_SUMMARY
+          echo "- **API**:      ${{ steps.ngrok_api.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Grafana**:  ${{ steps.ngrok_grafana.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Prometheus**: ${{ steps.ngrok_prom.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Grafana default credentials are usually \`admin/admin\` (or whatever you've provisioned)."
+
+      # --- Optional: seed some demo traffic so dashboards light up ---
+      - name: Seed demo traffic (optional)
+        if: ${{ github.event.inputs.seed_demo == 'true' }}
+        run: |
+          set -e
+          echo "Seeding ~60 inventory updates over ~30–60s…"
+          # Try to find a location & example SKU
+          loc=$(curl -s http://localhost:8000/debug/inventory/locations | jq -r '.locations[0].id // empty')
+          if [ -z "$loc" ]; then
+            echo "No location from /debug/inventory/locations; skipping seed."
+            exit 0
+          fi
+
+          # Replace this SKU with one that exists in your store if needed:
+          SKU="${SKU_OVERRIDE:-1896-S}"
+
+          # Ensure variant exists (no fail if 404)
+          curl -s "http://localhost:8000/debug/inventory/variant?sku=${SKU}" || true
+
+          for i in {1..60}; do
+            qty=$(( (RANDOM % 50) + 1 ))
+            curl -s -X POST "http://localhost:8000/debug/inventory/set?sku=${SKU}&available=${qty}&location_id=${loc}" >/dev/null || true
+            sleep=$(awk -v min=0.3 -v max=1.0 'BEGIN{srand(); print min+rand()*(max-min)}')
+            sleep $sleep
+          done
+
+      - name: Keep environment alive
+        run: |
+          mins=${{ github.event.inputs.keep_minutes }}
+          echo "Keeping tunnels up for ${mins} minutes…"
+          for i in $(seq 1 "$mins"); do
+            echo "  minute $i/${mins}"
+            sleep 60
+          done
+
+      # ---- diagnostics & teardown ----
+      - name: Dump container health
+        if: always()
+        run: docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml ps
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p logs
+          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml logs --no-color > logs/stack.log || true
+
+      - name: Upload logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stack-logs
+          path: logs/stack.log
+
+      - name: Down stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml down -v

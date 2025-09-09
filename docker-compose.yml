@@ -1,0 +1,58 @@
+﻿services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    env_file: .env
+    depends_on:
+      - api
+      - redis
+      - db
+    # listen on default Celery queue (good)
+    command: ["celery","-A","app.workers.celery_app.celery_app","worker","-l","INFO","-P","solo"]
+
+    ports:
+      - "8001:8001"   # <-- metrics
+
+
+
+  beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    env_file: .env
+    command: ["celery", "-A", "app.workers.celery_app.celery_app", "beat", "-l", "INFO"]
+    depends_on:
+      - worker
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: shopify
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"

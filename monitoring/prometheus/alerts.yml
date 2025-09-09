@@ -1,0 +1,39 @@
+groups:
+  - name: shopify-sync-alerts
+    interval: 15s
+    rules:
+      - alert: ShopifyApiTargetDown
+        expr: up{job="shopify-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Shopify API scrape target down"
+          description: "Prometheus cannot scrape the FastAPI /metrics endpoint for more than 1 minute."
+
+      - alert: NoInventoryUpdatesRecently
+        expr: increase(shopify_inventory_updates_total[10m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No inventory updates in the last 10 minutes"
+          description: "The counter shopify_inventory_updates_total has not increased in the last 10 minutes."
+
+      - alert: HighInventoryUpdateFailureRate
+        expr: (rate(inventory_updates_failed_total[5m]) / rate(inventory_updates_attempted_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Inventory update failure rate > 20% (5m)"
+          description: "Failure rate over the last 5 minutes is above threshold."
+
+      - alert: HighInventoryUpdateLatencyP95
+        expr: histogram_quantile(0.95, sum(rate(inventory_update_seconds_bucket[5m])) by (le)) > 1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Inventory update p95 latency > 1s (5m)"
+          description: "95th percentile latency computed from inventory_update_seconds histogram exceeds 1s."

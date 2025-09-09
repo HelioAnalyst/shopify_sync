@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: "Shopify Sync"
+    orgId: 1
+    folder: "Shopify Sync"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      path: /etc/grafana/dashboards

@@ -1,0 +1,6 @@
+route:
+  receiver: "blackhole"
+
+receivers:
+  - name: "blackhole"
+    # Add real receivers here (email, slack, webhook, etc.)
