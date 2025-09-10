@@ -1,41 +1,54 @@
 services:
-  prometheus:
-    image: prom/prometheus:v2.55.0
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--web.enable-lifecycle"
-    volumes:
-      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
-    ports:
-      - "9090:9090"
-    depends_on:
-      - api
-    networks:
-      - default
-
-  alertmanager:
-    image: prom/alertmanager:v0.27.0
-    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
-    volumes:
-      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-    ports:
-      - "9093:9093"
-    networks:
-      - default
-
   grafana:
-    image: grafana/grafana:10.4.2
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
-      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
-    ports:
-      - "3000:3000"
+    image: grafana/grafana:latest
     depends_on:
       - prometheus
-    networks:
-      - default
+    environment:
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+    ports:
+      - "3000:3000"   # optional; can be removed if you only want access via the edge
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.external-url=/prometheus
+      - --web.route-prefix=/prometheus
+    ports:
+      - "9090:9090"   # optional
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --web.external-url=/alertmanager
+      - --web.route-prefix=/alertmanager
+    ports:
+      - "9093:9093"   # optional
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+  # NEW: single entry-point for ngrok
+  edge:
+    image: caddy:2
+    depends_on:
+      - api
+      - grafana
+      - prometheus
+      - alertmanager
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./monitoring/edge.Caddyfile:/etc/caddy/Caddyfile:ro
+
+volumes:
+  grafana-data:
+  prometheus-data:

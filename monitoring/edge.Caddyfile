@@ -1,0 +1,24 @@
+:8080
+
+# Default route -> FastAPI
+route /* {
+  reverse_proxy api:8000
+}
+
+# Grafana at /grafana
+route /grafana* {
+  uri strip_prefix /grafana
+  reverse_proxy grafana:3000
+}
+
+# Prometheus at /prometheus
+route /prometheus* {
+  uri strip_prefix /prometheus
+  reverse_proxy prometheus:9090
+}
+
+# Alertmanager at /alertmanager
+route /alertmanager* {
+  uri strip_prefix /alertmanager
+  reverse_proxy alertmanager:9093
+}
