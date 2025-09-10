@@ -47,7 +47,8 @@ jobs:
 
       - name: Start ONE ngrok tunnel to reverse proxy ($PUBLIC_PORT)
         run: |
-          nohup ngrok http "${PUBLIC_PORT}" --log=stdout > ngrok.log 2>&1 &
+          # Force IPv4 to avoid ::1 resolution issues (ERR_NGROK_8012)
+          nohup ngrok http "http://127.0.0.1:${PUBLIC_PORT}" --log=stdout > ngrok.log 2>&1 &
           for i in {1..120}; do
             if curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null; then break; fi
             sleep 1
