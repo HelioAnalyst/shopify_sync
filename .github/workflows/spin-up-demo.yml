@@ -20,6 +20,8 @@ jobs:
       PROMETHEUS_ENABLE: "true"
       PROMETHEUS_WORKER_PORT: "8001"
       DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/shopify
+      # Use a high, non-conflicting host port for the reverse proxy
+      PUBLIC_PORT: "18080"
 
     steps:
       - name: Checkout
@@ -43,17 +45,17 @@ jobs:
           fi
           ngrok config add-authtoken "${NGROK_AUTHTOKEN}"
 
-      - name: Start ONE ngrok tunnel to reverse proxy (port 8080)
+      - name: Start ONE ngrok tunnel to reverse proxy ($PUBLIC_PORT)
         run: |
-          nohup ngrok http 8080 --log=stdout > ngrok.log 2>&1 &
-          # Wait for the agent admin API
-          for i in {1..90}; do
-            curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null && break
+          nohup ngrok http "${PUBLIC_PORT}" --log=stdout > ngrok.log 2>&1 &
+          for i in {1..120}; do
+            if curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null; then break; fi
             sleep 1
           done
-          NGROK_URL="$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -n1)"
+          NGROK_URL="$(curl -s http://127.0.0.1:4040/api/tunnels \
+            | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -n1)"
           if [ -z "$NGROK_URL" ]; then
-            echo "Failed to obtain public URL"; cat ngrok.log || true; exit 1
+            echo "Failed to obtain public URL"; tail -n +1 ngrok.log || true; exit 1
           fi
           echo "NGROK_URL=$NGROK_URL" | tee -a "$GITHUB_ENV"
           echo "GRAFANA_ROOT_URL=${NGROK_URL}/grafana/" | tee -a "$GITHUB_ENV"
@@ -122,8 +124,9 @@ jobs:
               restart: unless-stopped
               volumes:
                 - ./reverse-proxy.nginx.conf:/etc/nginx/nginx.conf:ro
+              # Map HOST:${PUBLIC_PORT} -> container:8080 (avoid 8080 conflicts on host)
               ports:
-                - "8080:8080"
+                - "${PUBLIC_PORT:-18080}:8080"
               depends_on:
                 - api
                 - grafana
@@ -137,9 +140,8 @@ jobs:
                 GF_SECURITY_ALLOW_EMBEDDING: "true"
           YML
 
-      - name: Create empty .env so Compose env_file references don’t fail
-        run: |
-          touch .env
+      - name: Create empty .env so any env_file refs don’t fail
+        run: touch .env
 
       - name: Bring up stack (API + worker + db + redis + monitoring + reverse-proxy)
         env:
@@ -185,6 +187,7 @@ jobs:
 
           # Grafana external URL (used in override)
           GRAFANA_ROOT_URL: ${{ env.GRAFANA_ROOT_URL }}
+          PUBLIC_PORT: ${{ env.PUBLIC_PORT }}
         run: |
           docker compose \
             -f docker-compose.yml \
@@ -196,25 +199,17 @@ jobs:
       - name: Wait for public endpoints
         run: |
           echo "Waiting for API..."
-          for i in {1..120}; do curl -sf "${NGROK_URL}/health" >/dev/null && break; sleep 2; done
+          for i in {1..180}; do curl -sf "${NGROK_URL}/health" >/dev/null && break; sleep 2; done
           echo "Waiting for Grafana..."
-          for i in {1..180}; do curl -sfL "${GRAFANA_ROOT_URL}login" >/dev/null && break; sleep 2; done
+          for i in {1..240}; do curl -sfL "${GRAFANA_ROOT_URL}login" >/dev/null && break; sleep 2; done
           echo "Waiting for Prometheus..."
-          for i in {1..120}; do curl -sfL "${NGROK_URL}/prometheus/graph" >/dev/null && break; sleep 2; done
+          for i in {1..180}; do curl -sfL "${NGROK_URL}/prometheus/graph" >/dev/null && break; sleep 2; done
           echo "Waiting for Alertmanager..."
-          for i in {1..120}; do curl -sfL "${NGROK_URL}/alertmanager/#/status" >/dev/null && break; sleep 2; done
+          for i in {1..180}; do curl -sfL "${NGROK_URL}/alertmanager/#/status" >/dev/null && break; sleep 2; done
           echo "Public API: ${NGROK_URL}"
           echo "Grafana:   ${GRAFANA_ROOT_URL}"
           echo "Prometheus:${NGROK_URL}/prometheus/"
           echo "Alerts:    ${NGROK_URL}/alertmanager/"
-
-      - name: Smoke checks
-        run: |
-          curl -sSf "${NGROK_URL}/health" || true
-          curl -sSf "${NGROK_URL}/metrics" | head -n 25 || true
-          curl -sSfL "${GRAFANA_ROOT_URL}login" | head -n 20 || true
-          curl -sSfL "${NGROK_URL}/prometheus/graph" | head -n 20 || true
-          curl -sSfL "${NGROK_URL}/alertmanager/#/status" | head -n 20 || true
 
       - name: Publish links
         run: |
@@ -228,7 +223,7 @@ jobs:
             echo "- **Prometheus**: ${NGROK_URL}/prometheus/"
             echo "- **Alertmanager**: ${NGROK_URL}/alertmanager/"
             echo ""
-            echo "_Runner will stay alive until you cancel the job (max ~6h)._"
+            echo "_Runner stays alive until you cancel (max ~6h)._"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive for demo
