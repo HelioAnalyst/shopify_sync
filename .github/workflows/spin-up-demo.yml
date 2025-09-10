@@ -9,7 +9,6 @@ jobs:
     timeout-minutes: 360
 
     env:
-      # Non-secret defaults
       ENV: dev
       LOG_LEVEL: INFO
       API_HOST: 0.0.0.0
@@ -41,46 +40,38 @@ jobs:
           if [ -z "${NGROK_AUTHTOKEN}" ]; then
             echo "Missing NGROK_AUTHTOKEN secret" >&2; exit 1
           fi
+          # writes token into ~/.config/ngrok/ngrok.yml
           ngrok config add-authtoken "${NGROK_AUTHTOKEN}"
 
       - name: Start a single ngrok agent with multiple tunnels
         run: |
-          # Create an ngrok config with all tunnels (one agent; avoids races on :4040)
+          # Our tunnel definitions (no token here)
           cat > "$HOME/ngrok.yml" <<'NG'
           version: "3"
+          web_addr: 127.0.0.1:4040
           tunnels:
-            api:
-              addr: 8000
-              proto: http
-              schemes: [https]
-            grafana:
-              addr: 3000
-              proto: http
-              schemes: [https]
-            prom:
-              addr: 9090
-              proto: http
-              schemes: [https]
-            alert:
-              addr: 9093
-              proto: http
-              schemes: [https]
+            api:     { addr: 8000, proto: http, schemes: [https] }
+            grafana: { addr: 3000, proto: http, schemes: [https] }
+            prom:    { addr: 9090, proto: http, schemes: [https] }
+            alert:   { addr: 9093, proto: http, schemes: [https] }
           NG
 
-          # Run one agent for all tunnels
-          nohup ngrok start --all --config "$HOME/ngrok.yml" --log=stdout > ngrok.log 2>&1 &
+          # Start ONE agent, loading BOTH configs (default has the authtoken)
+          nohup ngrok start --all \
+            --config "$HOME/.config/ngrok/ngrok.yml" \
+            --config "$HOME/ngrok.yml" \
+            --log=stdout > ngrok.log 2>&1 &
 
-          # Wait for the admin API
-          for i in {1..60}; do
-            if curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null; then break; fi
+          # Wait for admin API
+          for i in {1..90}; do
+            curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null && break
             sleep 1
           done
 
-          # Helper to read a tunnel by name
           get_by_name () {
-            local name="$1"
+            local n="$1"
             curl -s http://127.0.0.1:4040/api/tunnels \
-              | jq -r --arg n "$name" '.tunnels[] | select(.name==$n) | .public_url'
+              | jq -r --arg n "$n" '.tunnels[] | select(.name==$n) | .public_url'
           }
 
           API_PUBLIC_URL="$(get_by_name api)"
@@ -89,7 +80,10 @@ jobs:
           ALERT_PUBLIC_URL="$(get_by_name alert)"
 
           if [ -z "$API_PUBLIC_URL" ] || [ -z "$GRAFANA_PUBLIC_URL" ]; then
-            echo "Failed to obtain public URLs"; cat ngrok.log || true; curl -s http://127.0.0.1:4040/api/tunnels || true; exit 1
+            echo "Failed to obtain public URLs"
+            curl -s http://127.0.0.1:4040/api/tunnels || true
+            tail -n +1 ngrok.log || true
+            exit 1
           fi
 
           GRAFANA_DOMAIN="$(echo "$GRAFANA_PUBLIC_URL" | sed -E 's#^https?://([^/]+)/?.*$#\1#')"
@@ -118,26 +112,20 @@ jobs:
             echo "- **Grafana**: ${GRAFANA_PUBLIC_URL}  (login: \`admin/admin\` unless overridden)"
             [ -n "${PROM_PUBLIC_URL}" ] && echo "- **Prometheus**: ${PROM_PUBLIC_URL}"
             [ -n "${ALERT_PUBLIC_URL}" ] && echo "- **Alertmanager**: ${ALERT_PUBLIC_URL}"
-            echo ""
-            echo "> Use each URL directly (do **not** append /grafana or /prometheus to another URL)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Bring up stack (API + worker + db + redis + monitoring)
         env:
-          # Core / API
           ENV: ${{ env.ENV }}
           LOG_LEVEL: ${{ env.LOG_LEVEL }}
           API_HOST: ${{ env.API_HOST }}
           API_PORT: ${{ env.API_PORT }}
           APP_BASE_URL: ${{ env.API_PUBLIC_URL }}
-
-          # DB / Redis / Celery
           DATABASE_URL: ${{ env.DATABASE_URL }}
           REDIS_URL: ${{ env.REDIS_URL }}
           CELERY_BROKER_URL: ${{ env.REDIS_URL }}
           CELERY_RESULT_BACKEND: ${{ env.REDIS_URL }}
 
-          # Shopify (secrets)
           SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
           SHOPIFY_API_VERSION: ${{ env.SHOPIFY_API_VERSION }}
           SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
@@ -149,7 +137,6 @@ jobs:
           SHOPIFY_WEBHOOK_SECRET: ${{ secrets.SHOPIFY_WEBHOOK_SECRET }}
           SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
 
-          # BC365
           BC365_BASE_URL: ${{ secrets.BC365_BASE_URL }}
           BC365_TENANT_ID: ${{ secrets.BC365_TENANT_ID }}
           BC365_ENVIRONMENT: ${{ secrets.BC365_ENVIRONMENT }}
@@ -159,12 +146,11 @@ jobs:
           BC365_DEFAULT_CUSTOMER: ${{ secrets.BC365_DEFAULT_CUSTOMER }}
           SKU_MAP_JSON: ${{ secrets.SKU_MAP_JSON }}
 
-          # Security & Observability
           ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
           PROMETHEUS_ENABLE: ${{ env.PROMETHEUS_ENABLE }}
           PROMETHEUS_WORKER_PORT: ${{ env.PROMETHEUS_WORKER_PORT }}
 
-          # Tell Grafana its real public URL so it doesn't redirect to localhost
+          # Make Grafana use its public URL (prevents redirects to localhost)
           GF_SERVER_ROOT_URL: ${{ env.GRAFANA_PUBLIC_URL }}/
           GF_SERVER_DOMAIN: ${{ env.GRAFANA_DOMAIN }}
         run: |
@@ -174,9 +160,9 @@ jobs:
       - name: Wait for services
         run: |
           echo "Waiting for API..."
-          for i in {1..90}; do curl -sf http://localhost:8000/health >/dev/null && break; sleep 2; done
+          for i in {1..120}; do curl -sf http://localhost:8000/health >/dev/null && break; sleep 2; done
           echo "Waiting for Grafana..."
-          for i in {1..120}; do curl -sfL "${GRAFANA_PUBLIC_URL}/login" >/dev/null && break; sleep 2; done
+          for i in {1..180}; do curl -sfL "${GRAFANA_PUBLIC_URL}/login" >/dev/null && break; sleep 2; done
           echo "API: ${API_PUBLIC_URL}"
           echo "Grafana: ${GRAFANA_PUBLIC_URL}"
 
@@ -184,9 +170,9 @@ jobs:
         run: |
           curl -sSf "${API_PUBLIC_URL}/metrics" | head -n 30 || true
           curl -sSf "${API_PUBLIC_URL}/health" || true
-          curl -sSfL "${GRAFANA_PUBLIC_URL}/login" | head -n 20 || true
+          curl -sSfL "${GRAFANA_PUBLIC_URL}/login" | head -n 15 || true
 
       - name: Keep alive for manual testing
         run: |
-          echo "Webhook-ready. Leave this running; cancel when finished. (Max ~6h)"
+          echo "Webhook-ready. Leave running; cancel when done. (Max ~6h)"
           while true; do date; sleep 60; done
