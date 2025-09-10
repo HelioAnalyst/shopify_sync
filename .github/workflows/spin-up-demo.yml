@@ -1,238 +1,149 @@
-name: Spin Up Demo (Docker + ngrok)
+name: Spin up Demo (Docker + ngrok)
 
 on:
   workflow_dispatch:
-
-concurrency:
-  group: spin-up-demo
-  cancel-in-progress: true
+    inputs:
+      keep_minutes:
+        description: "How long to keep the tunnels alive"
+        required: true
+        default: "20"
+      seed_demo:
+        description: "Seed some demo inventory updates?"
+        type: boolean
+        default: true
 
 jobs:
   demo:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: read
+
     env:
-      # Defaults for non-secret values
-      ENV: dev
-      LOG_LEVEL: INFO
-      API_HOST: 0.0.0.0
-      API_PORT: 8000
-      SHOPIFY_API_VERSION: 2024-10
-      OAUTH_SCOPES: read_products,write_products,read_inventory,write_inventory,read_orders
-      REDIS_URL: redis://redis:6379/0
-      PROMETHEUS_ENABLE: "true"
-      PROMETHEUS_WORKER_PORT: "8001"
+      # ---- App env (map these to your own needs) ----
+      SHOPIFY_API_KEY: ${{ secrets.SHOPIFY_API_KEY }}
+      SHOPIFY_PASSWORD: ${{ secrets.SHOPIFY_PASSWORD }}
+      SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+      SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+      SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+      # any BC365 or DB vars you use in docker-compose:
+      BC365_BASE_URL: ${{ secrets.BC365_BASE_URL }}
+      BC365_USERNAME: ${{ secrets.BC365_USERNAME }}
+      BC365_PASSWORD: ${{ secrets.BC365_PASSWORD }}
+
+      # ---- ngrok ----
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies (jq, ngrok)
+      - name: Docker version
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-          # Install ngrok
-          curl -sS https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
-            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
-          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
-            | sudo tee /etc/apt/sources.list.d/ngrok.list
-          sudo apt-get update -y
-          sudo apt-get install -y ngrok
+          docker --version
+          docker compose version
 
-      - name: Configure ngrok
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
-        run: |
-          ngrok config add-authtoken "${NGROK_AUTHTOKEN}"
-          # create a config with two tunnels so both start together
-          mkdir -p ~/.config/ngrok
-          cat > ~/.config/ngrok/ngrok.yml <<'NG'
-          version: "2"
-          authtoken: ${NGROK_AUTHTOKEN}
-          tunnels:
-            api:
-              addr: 8000
-              proto: http
-            grafana:
-              addr: 3000
-              proto: http
-          NG
-
-      - name: Bring up stack (API + worker + db + redis + monitoring)
+      - name: Build & start stack (app + monitoring)
         run: |
           docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml up -d --build
-          docker ps -a
-
-      - name: Wait for API & Grafana to be ready
-        run: |
-          for i in {1..90}; do
-            API_OK=0
-            GRAFANA_OK=0
-
-            curl -sf http://localhost:8000/openapi.json >/dev/null && API_OK=1
-            curl -sf http://localhost:3000/login >/dev/null && GRAFANA_OK=1
-
-            if [ "$API_OK" = "1" ] && [ "$GRAFANA_OK" = "1" ]; then
-              echo "API and Grafana are up"
-              exit 0
-            fi
-            sleep 2
+          echo "Waiting for API health..."
+          for i in {1..60}; do
+            curl -fsS http://localhost:8000/health && break || true
+            sleep 3
           done
-          echo "Services failed to start in time" >&2
-          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml ps
-          exit 1
+          echo "Containers:"
+          docker compose ps
 
-      - name: Start ngrok tunnels (API :8000 & Grafana :3000)
+      # --- Start ngrok tunnels (one step per tunnel, backgrounded) ---
+      - name: Start ngrok (API :8000)
+        id: ngrok_api
+        uses: ngrok/ngrok-action@v2
+        with:
+          authtoken: ${{ env.NGROK_AUTHTOKEN }}
+          addr: http://localhost:8000
+          proto: http
+          background: true
+
+      - name: Start ngrok (Grafana :3000)
+        id: ngrok_grafana
+        uses: ngrok/ngrok-action@v2
+        with:
+          authtoken: ${{ env.NGROK_AUTHTOKEN }}
+          addr: http://localhost:3000
+          proto: http
+          background: true
+
+      - name: Start ngrok (Prometheus :9090)
+        id: ngrok_prom
+        uses: ngrok/ngrok-action@v2
+        with:
+          authtoken: ${{ env.NGROK_AUTHTOKEN }}
+          addr: http://localhost:9090
+          proto: http
+          background: true
+
+      - name: Show public URLs
         run: |
-          nohup ngrok start --all --log=stdout > ngrok.log 2>&1 &
-          # wait for local ngrok API
-          for i in {1..30}; do
-            if curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null; then break; fi
-            sleep 1
+          echo "### Public URLs" >> $GITHUB_STEP_SUMMARY
+          echo "- **API**:      ${{ steps.ngrok_api.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Grafana**:  ${{ steps.ngrok_grafana.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Prometheus**: ${{ steps.ngrok_prom.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Grafana default credentials are usually \`admin/admin\` (or whatever you've provisioned)."
+
+      # --- Optional: seed some demo traffic so dashboards light up ---
+      - name: Seed demo traffic (optional)
+        if: ${{ github.event.inputs.seed_demo == 'true' }}
+        run: |
+          set -e
+          echo "Seeding ~60 inventory updates over ~30–60s…"
+          # Try to find a location & example SKU
+          loc=$(curl -s http://localhost:8000/debug/inventory/locations | jq -r '.locations[0].id // empty')
+          if [ -z "$loc" ]; then
+            echo "No location from /debug/inventory/locations; skipping seed."
+            exit 0
+          fi
+
+          # Replace this SKU with one that exists in your store if needed:
+          SKU="${SKU_OVERRIDE:-1896-S}"
+
+          # Ensure variant exists (no fail if 404)
+          curl -s "http://localhost:8000/debug/inventory/variant?sku=${SKU}" || true
+
+          for i in {1..60}; do
+            qty=$(( (RANDOM % 50) + 1 ))
+            curl -s -X POST "http://localhost:8000/debug/inventory/set?sku=${SKU}&available=${qty}&location_id=${loc}" >/dev/null || true
+            sleep=$(awk -v min=0.3 -v max=1.0 'BEGIN{srand(); print min+rand()*(max-min)}')
+            sleep $sleep
           done
-          # capture URLs
-          NGROK_API_URL="$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.name=="api") | .public_url')"
-          NGROK_GRAFANA_URL="$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.name=="grafana") | .public_url')"
 
-          echo "NGROK_API_URL=$NGROK_API_URL" | tee -a $GITHUB_ENV
-          echo "NGROK_GRAFANA_URL=$NGROK_GRAFANA_URL" | tee -a $GITHUB_ENV
-
-          echo "::notice title=API URL::$NGROK_API_URL"
-          echo "::notice title=Grafana URL::$NGROK_GRAFANA_URL"
-
-      - name: Generate .env for containers (with APP_BASE_URL)
-        env:
-          # Core / API
-          ENV: ${{ env.ENV }}
-          LOG_LEVEL: ${{ env.LOG_LEVEL }}
-          API_HOST: ${{ env.API_HOST }}
-          API_PORT: ${{ env.API_PORT }}
-          APP_BASE_URL: ${{ env.NGROK_API_URL }}
-
-          # DB (service name "db" in compose)
-          DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/shopify
-
-          # Redis / Celery
-          REDIS_URL: ${{ env.REDIS_URL }}
-
-          # Shopify
-          SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
-          SHOPIFY_API_VERSION: ${{ env.SHOPIFY_API_VERSION }}
-          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
-          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
-          OAUTH_SCOPES: ${{ env.OAUTH_SCOPES }}
-          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
-          SHOPIFY_API_KEY: ${{ secrets.SHOPIFY_API_KEY }}
-          SHOPIFY_API_PASSWORD: ${{ secrets.SHOPIFY_API_PASSWORD }}
-          SHOPIFY_WEBHOOK_SECRET: ${{ secrets.SHOPIFY_WEBHOOK_SECRET }}
-          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
-
-          # BC365
-          BC365_BASE_URL: ${{ secrets.BC365_BASE_URL }}
-          BC365_TENANT_ID: ${{ secrets.BC365_TENANT_ID }}
-          BC365_ENVIRONMENT: ${{ secrets.BC365_ENVIRONMENT }}
-          BC365_CLIENT_ID: ${{ secrets.BC365_CLIENT_ID }}
-          BC365_CLIENT_SECRET: ${{ secrets.BC365_CLIENT_SECRET }}
-          BC365_COMPANY_ID: ${{ secrets.BC365_COMPANY_ID }}
-          BC365_DEFAULT_CUSTOMER: ${{ secrets.BC365_DEFAULT_CUSTOMER }}
-          SKU_MAP_JSON: ${{ secrets.SKU_MAP_JSON }}
-
-          # Security & Observability
-          ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
-          PROMETHEUS_ENABLE: ${{ env.PROMETHEUS_ENABLE }}
-          PROMETHEUS_WORKER_PORT: ${{ env.PROMETHEUS_WORKER_PORT }}
+      - name: Keep environment alive
         run: |
-          cat > .env <<EOF
-          ##############################################
-          # Generated by GitHub Action – DO NOT COMMIT #
-          ##############################################
-          ENV=${ENV}
-          LOG_LEVEL=${LOG_LEVEL}
+          mins=${{ github.event.inputs.keep_minutes }}
+          echo "Keeping tunnels up for ${mins} minutes…"
+          for i in $(seq 1 "$mins"); do
+            echo "  minute $i/${mins}"
+            sleep 60
+          done
 
-          API_HOST=${API_HOST}
-          API_PORT=${API_PORT}
-          APP_BASE_URL=${APP_BASE_URL}
+      # ---- diagnostics & teardown ----
+      - name: Dump container health
+        if: always()
+        run: docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml ps
 
-          DATABASE_URL=${DATABASE_URL}
-
-          REDIS_URL=${REDIS_URL}
-          CELERY_BROKER_URL=${REDIS_URL}
-          CELERY_RESULT_BACKEND=${REDIS_URL}
-
-          SHOPIFY_SHOP=${SHOPIFY_SHOP}
-          SHOPIFY_API_VERSION=${SHOPIFY_API_VERSION}
-          SHOPIFY_CLIENT_ID=${SHOPIFY_CLIENT_ID}
-          SHOPIFY_CLIENT_SECRET=${SHOPIFY_CLIENT_SECRET}
-          OAUTH_SCOPES=${OAUTH_SCOPES}
-          SHOPIFY_ACCESS_TOKEN=${SHOPIFY_ACCESS_TOKEN}
-
-          SHOPIFY_API_KEY=${SHOPIFY_API_KEY}
-          SHOPIFY_API_PASSWORD=${SHOPIFY_API_PASSWORD}
-          SHOPIFY_WEBHOOK_SECRET=${SHOPIFY_WEBHOOK_SECRET}
-          SHOPIFY_LOCATION_ID=${SHOPIFY_LOCATION_ID}
-
-          BC365_BASE_URL=${BC365_BASE_URL}
-          BC365_TENANT_ID=${BC365_TENANT_ID}
-          BC365_ENVIRONMENT=${BC365_ENVIRONMENT}
-          BC365_CLIENT_ID=${BC365_CLIENT_ID}
-          BC365_CLIENT_SECRET=${BC365_CLIENT_SECRET}
-          BC365_COMPANY_ID=${BC365_COMPANY_ID}
-          BC365_DEFAULT_CUSTOMER=${BC365_DEFAULT_CUSTOMER}
-          SKU_MAP_JSON='${SKU_MAP_JSON}'
-
-          ADMIN_API_TOKEN=${ADMIN_API_TOKEN}
-
-          PROMETHEUS_ENABLE=${PROMETHEUS_ENABLE}
-          PROMETHEUS_WORKER_PORT=${PROMETHEUS_WORKER_PORT}
-          EOF
-
-          echo "Wrote .env:"
-          sed -e 's/\(CLIENT_SECRET=\).*/\1****/g' \
-              -e 's/\(ACCESS_TOKEN=\).*/\1****/g' \
-              -e 's/\(API_PASSWORD=\).*/\1****/g' .env
-
-      - name: Quick smoke check
+      - name: Collect logs
+        if: always()
         run: |
-          curl -fsS http://localhost:8000/health || true
-          curl -fsS http://localhost:8000/metrics | head -n 50 || true
+          mkdir -p logs
+          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml logs --no-color > logs/stack.log || true
 
-      - name: Publish URLs to job summary
-        run: |
-          {
-            echo "## Live Demo URLs"
-            echo ""
-            echo "- **API**: ${{ env.NGROK_API_URL }}"
-            echo "  - Swagger: ${{ env.NGROK_API_URL }}/docs"
-            echo "  - Health:  ${{ env.NGROK_API_URL }}/health"
-            echo "  - Metrics: ${{ env.NGROK_API_URL }}/metrics"
-            echo ""
-            echo "- **Grafana**: ${{ env.NGROK_GRAFANA_URL }}"
-            echo "  - Login page: ${{ env.NGROK_GRAFANA_URL }}/login (default admin/admin if unchanged)"
-            echo ""
-            echo "### Shopify webhook base"
-            echo "Use \`${{ env.NGROK_API_URL }}\` as your webhook base URL, e.g.:"
-            echo "- Orders Create: \`${{ env.NGROK_API_URL }}/webhooks/shopify/orders/create\`"
-            echo "- App Uninstalled: \`${{ env.NGROK_API_URL }}/webhooks/shopify/app/uninstalled\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload logs (ngrok + compose files)
+      - name: Upload logs artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: demo-boot-logs
-          path: |
-            ngrok.log
-            docker-compose.yml
-            monitoring/docker-compose.addon.yml
+          name: stack-logs
+          path: logs/stack.log
 
-      # Keep running so the ngrok URLs stay alive for webhooks during the demo
-      - name: Keep alive until cancelled (max ~6h)
-        run: |
-          echo "Demo running. Public URLs:"
-          echo "API:     $NGROK_API_URL"
-          echo "Grafana: $NGROK_GRAFANA_URL"
-          echo "Press 'Cancel workflow' when you're done."
-          # trap to print a final note on cancel
-          trap 'echo "Shutting down demo runner..."' TERM INT
-          while true; do sleep 60; done
-
-      # Intentionally no teardown: containers die when the runner stops/cancels
+      - name: Down stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml down -v
