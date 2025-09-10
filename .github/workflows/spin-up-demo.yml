@@ -11,6 +11,7 @@ on:
         description: "Seed some demo inventory updates?"
         type: boolean
         default: true
+        
 
 jobs:
   demo:
