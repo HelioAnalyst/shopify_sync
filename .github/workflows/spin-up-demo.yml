@@ -24,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies (jq, ngrok)
+      - name: Install jq + ngrok
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq
@@ -40,27 +40,12 @@ jobs:
           if [ -z "${NGROK_AUTHTOKEN}" ]; then
             echo "Missing NGROK_AUTHTOKEN secret" >&2; exit 1
           fi
-          # writes token into ~/.config/ngrok/ngrok.yml
           ngrok config add-authtoken "${NGROK_AUTHTOKEN}"
 
-      - name: Start a single ngrok agent with multiple tunnels
+      - name: Start ONE ngrok tunnel to reverse proxy (port 8080)
         run: |
-          # Our tunnel definitions (no token here)
-          cat > "$HOME/ngrok.yml" <<'NG'
-          version: "3"
-          web_addr: 127.0.0.1:4040
-          tunnels:
-            api:     { addr: 8000, proto: http, schemes: [https] }
-            grafana: { addr: 3000, proto: http, schemes: [https] }
-            prom:    { addr: 9090, proto: http, schemes: [https] }
-            alert:   { addr: 9093, proto: http, schemes: [https] }
-          NG
-
-          # Start ONE agent, loading BOTH configs (default has the authtoken)
-          nohup ngrok start --all \
-            --config "$HOME/.config/ngrok/ngrok.yml" \
-            --config "$HOME/ngrok.yml" \
-            --log=stdout > ngrok.log 2>&1 &
+          # Start a single tunnel (free plan compatible)
+          nohup ngrok http 8080 --log=stdout > ngrok.log 2>&1 &
 
           # Wait for admin API
           for i in {1..90}; do
@@ -68,59 +53,75 @@ jobs:
             sleep 1
           done
 
-          get_by_name () {
-            local n="$1"
-            curl -s http://127.0.0.1:4040/api/tunnels \
-              | jq -r --arg n "$n" '.tunnels[] | select(.name==$n) | .public_url'
-          }
-
-          API_PUBLIC_URL="$(get_by_name api)"
-          GRAFANA_PUBLIC_URL="$(get_by_name grafana)"
-          PROM_PUBLIC_URL="$(get_by_name prom)"
-          ALERT_PUBLIC_URL="$(get_by_name alert)"
-
-          if [ -z "$API_PUBLIC_URL" ] || [ -z "$GRAFANA_PUBLIC_URL" ]; then
-            echo "Failed to obtain public URLs"
-            curl -s http://127.0.0.1:4040/api/tunnels || true
-            tail -n +1 ngrok.log || true
-            exit 1
+          # Grab the public https URL
+          NGROK_URL="$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -n1)"
+          if [ -z "$NGROK_URL" ]; then
+            echo "Failed to obtain public URL"; cat ngrok.log || true; exit 1
           fi
+          echo "NGROK_URL=$NGROK_URL" | tee -a "$GITHUB_ENV"
+          GRAFANA_ROOT_URL="${NGROK_URL}/grafana/"
+          echo "GRAFANA_ROOT_URL=$GRAFANA_ROOT_URL" | tee -a "$GITHUB_ENV"
+          echo "::notice title=Public URL::$NGROK_URL"
 
-          GRAFANA_DOMAIN="$(echo "$GRAFANA_PUBLIC_URL" | sed -E 's#^https?://([^/]+)/?.*$#\1#')"
-
-          {
-            echo "API_PUBLIC_URL=$API_PUBLIC_URL"
-            echo "GRAFANA_PUBLIC_URL=$GRAFANA_PUBLIC_URL"
-            echo "PROM_PUBLIC_URL=$PROM_PUBLIC_URL"
-            echo "ALERT_PUBLIC_URL=$ALERT_PUBLIC_URL"
-            echo "GRAFANA_DOMAIN=$GRAFANA_DOMAIN"
-          } | tee -a "$GITHUB_ENV"
-
-          echo "::notice title=API URL::$API_PUBLIC_URL"
-          echo "::notice title=Grafana URL::$GRAFANA_PUBLIC_URL"
-          [ -n "$PROM_PUBLIC_URL" ] && echo "::notice title=Prometheus URL::$PROM_PUBLIC_URL"
-          [ -n "$ALERT_PUBLIC_URL" ] && echo "::notice title=Alertmanager URL::$ALERT_PUBLIC_URL"
-
-      - name: Show URLs in Job Summary
+      - name: Write reverse proxy (Nginx) and compose override
         run: |
-          {
-            echo "## Public URLs"
-            echo "- **API**: ${API_PUBLIC_URL}"
-            echo "  - Swagger: ${API_PUBLIC_URL}/docs"
-            echo "  - Health:  ${API_PUBLIC_URL}/health"
-            echo "  - Metrics: ${API_PUBLIC_URL}/metrics"
-            echo "- **Grafana**: ${GRAFANA_PUBLIC_URL}  (login: \`admin/admin\` unless overridden)"
-            [ -n "${PROM_PUBLIC_URL}" ] && echo "- **Prometheus**: ${PROM_PUBLIC_URL}"
-            [ -n "${ALERT_PUBLIC_URL}" ] && echo "- **Alertmanager**: ${ALERT_PUBLIC_URL}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          cat > reverse-proxy.nginx.conf <<'NGINX'
+          events {}
+          http {
+            server {
+              listen 8080;
+              server_name _;
 
-      - name: Bring up stack (API + worker + db + redis + monitoring)
+              # API at /
+              location / {
+                proxy_pass http://api:8000;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+
+              # Grafana at /grafana/
+              location /grafana/ {
+                proxy_pass http://grafana:3000/;
+                proxy_http_version 1.1;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              }
+            }
+          }
+          NGINX
+
+          # Compose override: add reverse-proxy service and tell Grafana to serve from subpath
+          cat > reverse-proxy.compose.yml <<'YML'
+          services:
+            reverse-proxy:
+              image: nginx:1.25
+              restart: unless-stopped
+              volumes:
+                - ./reverse-proxy.nginx.conf:/etc/nginx/nginx.conf:ro
+              ports:
+                - "8080:8080"
+              depends_on:
+                - api
+                - grafana
+
+            grafana:
+              environment:
+                GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}
+                GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+          YML
+
+      - name: Bring up stack (API + worker + db + redis + monitoring + reverse-proxy)
         env:
           ENV: ${{ env.ENV }}
           LOG_LEVEL: ${{ env.LOG_LEVEL }}
           API_HOST: ${{ env.API_HOST }}
           API_PORT: ${{ env.API_PORT }}
-          APP_BASE_URL: ${{ env.API_PUBLIC_URL }}
+          APP_BASE_URL: ${{ env.NGROK_URL }}
+
           DATABASE_URL: ${{ env.DATABASE_URL }}
           REDIS_URL: ${{ env.REDIS_URL }}
           CELERY_BROKER_URL: ${{ env.REDIS_URL }}
@@ -150,29 +151,44 @@ jobs:
           PROMETHEUS_ENABLE: ${{ env.PROMETHEUS_ENABLE }}
           PROMETHEUS_WORKER_PORT: ${{ env.PROMETHEUS_WORKER_PORT }}
 
-          # Make Grafana use its public URL (prevents redirects to localhost)
-          GF_SERVER_ROOT_URL: ${{ env.GRAFANA_PUBLIC_URL }}/
-          GF_SERVER_DOMAIN: ${{ env.GRAFANA_DOMAIN }}
+          # from earlier step
+          GRAFANA_ROOT_URL: ${{ env.GRAFANA_ROOT_URL }}
         run: |
-          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml up -d --build
+          docker compose \
+            -f docker-compose.yml \
+            -f monitoring/docker-compose.addon.yml \
+            -f reverse-proxy.compose.yml \
+            up -d --build
           docker ps -a
 
-      - name: Wait for services
+      - name: Wait for API and Grafana
         run: |
           echo "Waiting for API..."
           for i in {1..120}; do curl -sf http://localhost:8000/health >/dev/null && break; sleep 2; done
-          echo "Waiting for Grafana..."
-          for i in {1..180}; do curl -sfL "${GRAFANA_PUBLIC_URL}/login" >/dev/null && break; sleep 2; done
-          echo "API: ${API_PUBLIC_URL}"
-          echo "Grafana: ${GRAFANA_PUBLIC_URL}"
+          echo "Waiting for Grafana via tunnel..."
+          for i in {1..180}; do curl -sfL "${GRAFANA_ROOT_URL}login" >/dev/null && break; sleep 2; done
+          echo "Public API: ${NGROK_URL}"
+          echo "Grafana: ${GRAFANA_ROOT_URL}"
 
       - name: Smoke checks
         run: |
-          curl -sSf "${API_PUBLIC_URL}/metrics" | head -n 30 || true
-          curl -sSf "${API_PUBLIC_URL}/health" || true
-          curl -sSfL "${GRAFANA_PUBLIC_URL}/login" | head -n 15 || true
+          curl -sSf "${NGROK_URL}/metrics" | head -n 30 || true
+          curl -sSf "${NGROK_URL}/health" || true
+          curl -sSfL "${GRAFANA_ROOT_URL}login" | head -n 20 || true
+
+      - name: Show links
+        run: |
+          {
+            echo "## Public URLs"
+            echo "- **API**: ${NGROK_URL}"
+            echo "  - Swagger: ${NGROK_URL}/docs"
+            echo "  - Health:  ${NGROK_URL}/health"
+            echo "  - Metrics: ${NGROK_URL}/metrics"
+            echo "- **Grafana**: ${GRAFANA_ROOT_URL}"
+            echo "  - Login: admin / admin (unless overridden)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep alive for manual testing
         run: |
-          echo "Webhook-ready. Leave running; cancel when done. (Max ~6h)"
+          echo "Webhook-ready at ${NGROK_URL}. Leave running; cancel when done (max ~6h)."
           while true; do date; sleep 60; done
