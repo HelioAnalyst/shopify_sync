@@ -12,7 +12,6 @@ on:
         type: boolean
         default: true
         
-
 jobs:
   demo:
     runs-on: ubuntu-latest
@@ -89,7 +88,7 @@ jobs:
           echo "- **API**:      ${{ steps.ngrok_api.outputs.url }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Grafana**:  ${{ steps.ngrok_grafana.outputs.url }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Prometheus**: ${{ steps.ngrok_prom.outputs.url }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY 
           echo "> Grafana default credentials are usually \`admin/admin\` (or whatever you've provisioned)."
 
       # --- Optional: seed some demo traffic so dashboards light up ---
