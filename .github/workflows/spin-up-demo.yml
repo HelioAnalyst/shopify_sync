@@ -43,36 +43,55 @@ jobs:
           fi
           ngrok config add-authtoken "${NGROK_AUTHTOKEN}"
 
-      - name: Start ngrok tunnels (API:8000, Grafana:3000, Prometheus:9090, Alertmanager:9093)
+      - name: Start a single ngrok agent with multiple tunnels
         run: |
-          nohup ngrok http 8000 --log=stdout > ngrok_api.log 2>&1 &
-          nohup ngrok http 3000 --log=stdout > ngrok_grafana.log 2>&1 &
-          nohup ngrok http 9090 --log=stdout > ngrok_prom.log 2>&1 &
-          nohup ngrok http 9093 --log=stdout > ngrok_alert.log 2>&1 &
+          # Create an ngrok config with all tunnels (one agent; avoids races on :4040)
+          cat > "$HOME/ngrok.yml" <<'NG'
+          version: "3"
+          tunnels:
+            api:
+              addr: 8000
+              proto: http
+              schemes: [https]
+            grafana:
+              addr: 3000
+              proto: http
+              schemes: [https]
+            prom:
+              addr: 9090
+              proto: http
+              schemes: [https]
+            alert:
+              addr: 9093
+              proto: http
+              schemes: [https]
+          NG
 
-          # Wait for the local ngrok admin API
-          for i in {1..40}; do
-            curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null && break
+          # Run one agent for all tunnels
+          nohup ngrok start --all --config "$HOME/ngrok.yml" --log=stdout > ngrok.log 2>&1 &
+
+          # Wait for the admin API
+          for i in {1..60}; do
+            if curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null; then break; fi
             sleep 1
           done
 
-          get_url() {
-            local port="$1"
+          # Helper to read a tunnel by name
+          get_by_name () {
+            local name="$1"
             curl -s http://127.0.0.1:4040/api/tunnels \
-              | jq -r --arg p ":$port" '.tunnels[] | select(.config.addr | endswith($p)) | select(.public_url | startswith("https://")) | .public_url' \
-              | head -n1
+              | jq -r --arg n "$name" '.tunnels[] | select(.name==$n) | .public_url'
           }
 
-          API_PUBLIC_URL="$(get_url 8000)"
-          GRAFANA_PUBLIC_URL="$(get_url 3000)"
-          PROM_PUBLIC_URL="$(get_url 9090)"
-          ALERT_PUBLIC_URL="$(get_url 9093)"
+          API_PUBLIC_URL="$(get_by_name api)"
+          GRAFANA_PUBLIC_URL="$(get_by_name grafana)"
+          PROM_PUBLIC_URL="$(get_by_name prom)"
+          ALERT_PUBLIC_URL="$(get_by_name alert)"
 
           if [ -z "$API_PUBLIC_URL" ] || [ -z "$GRAFANA_PUBLIC_URL" ]; then
-            echo "Failed to obtain public URLs"; curl -s http://127.0.0.1:4040/api/tunnels || true; exit 1
+            echo "Failed to obtain public URLs"; cat ngrok.log || true; curl -s http://127.0.0.1:4040/api/tunnels || true; exit 1
           fi
 
-          # Domain (host) for Grafana
           GRAFANA_DOMAIN="$(echo "$GRAFANA_PUBLIC_URL" | sed -E 's#^https?://([^/]+)/?.*$#\1#')"
 
           {
@@ -100,7 +119,7 @@ jobs:
             [ -n "${PROM_PUBLIC_URL}" ] && echo "- **Prometheus**: ${PROM_PUBLIC_URL}"
             [ -n "${ALERT_PUBLIC_URL}" ] && echo "- **Alertmanager**: ${ALERT_PUBLIC_URL}"
             echo ""
-            echo "> Note: each app has its own URL; don’t append */grafana* or */prometheus* to other domains."
+            echo "> Use each URL directly (do **not** append /grafana or /prometheus to another URL)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Bring up stack (API + worker + db + redis + monitoring)
@@ -118,7 +137,7 @@ jobs:
           CELERY_BROKER_URL: ${{ env.REDIS_URL }}
           CELERY_RESULT_BACKEND: ${{ env.REDIS_URL }}
 
-          # Shopify secrets
+          # Shopify (secrets)
           SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
           SHOPIFY_API_VERSION: ${{ env.SHOPIFY_API_VERSION }}
           SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
@@ -145,8 +164,8 @@ jobs:
           PROMETHEUS_ENABLE: ${{ env.PROMETHEUS_ENABLE }}
           PROMETHEUS_WORKER_PORT: ${{ env.PROMETHEUS_WORKER_PORT }}
 
-          # Grafana public URL/domain so it won't redirect to localhost
-          GF_SERVER_ROOT_URL: ${{ env.GRAFANA_PUBLIC_URL }}
+          # Tell Grafana its real public URL so it doesn't redirect to localhost
+          GF_SERVER_ROOT_URL: ${{ env.GRAFANA_PUBLIC_URL }}/
           GF_SERVER_DOMAIN: ${{ env.GRAFANA_DOMAIN }}
         run: |
           docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml up -d --build
@@ -155,7 +174,7 @@ jobs:
       - name: Wait for services
         run: |
           echo "Waiting for API..."
-          for i in {1..90}; do curl -sf http://localhost:8000/health && break; sleep 2; done
+          for i in {1..90}; do curl -sf http://localhost:8000/health >/dev/null && break; sleep 2; done
           echo "Waiting for Grafana..."
           for i in {1..120}; do curl -sfL "${GRAFANA_PUBLIC_URL}/login" >/dev/null && break; sleep 2; done
           echo "API: ${API_PUBLIC_URL}"

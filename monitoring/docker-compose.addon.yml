@@ -5,14 +5,13 @@ services:
       - prometheus
     environment:
       - GF_SERVER_HTTP_PORT=3000
-      - GF_SERVER_ROOT_URL=${GF_SERVER_ROOT_URL:-http://localhost:3000/}  # overridden by workflow
-      - GF_SERVER_DOMAIN=${GF_SERVER_DOMAIN:-localhost}                   # overridden by workflow
-      - GF_SERVER_ENFORCE_DOMAIN=false
-      - GF_SERVER_SERVE_FROM_SUB_PATH=false
+      - GF_SERVER_ROOT_URL=${GF_SERVER_ROOT_URL:-http://localhost:3000/}
+      - GF_SERVER_DOMAIN=${GF_SERVER_DOMAIN:-localhost}
       - GF_AUTH_ANONYMOUS_ENABLED=${GRAFANA_ANON_ENABLED:-true}
       - GF_AUTH_ANONYMOUS_ORG_ROLE=${GRAFANA_ANON_ROLE:-Viewer}
       - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+
     ports:
       - "3000:3000"   # optional; can be removed if you only want access via the edge
     volumes:
