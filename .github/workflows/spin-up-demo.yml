@@ -9,6 +9,7 @@ jobs:
     timeout-minutes: 360
 
     env:
+      # Non-secret defaults
       ENV: dev
       LOG_LEVEL: INFO
       API_HOST: 0.0.0.0
@@ -44,26 +45,21 @@ jobs:
 
       - name: Start ONE ngrok tunnel to reverse proxy (port 8080)
         run: |
-          # Start a single tunnel (free plan compatible)
           nohup ngrok http 8080 --log=stdout > ngrok.log 2>&1 &
-
-          # Wait for admin API
+          # Wait for the agent admin API
           for i in {1..90}; do
             curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null && break
             sleep 1
           done
-
-          # Grab the public https URL
           NGROK_URL="$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -n1)"
           if [ -z "$NGROK_URL" ]; then
             echo "Failed to obtain public URL"; cat ngrok.log || true; exit 1
           fi
           echo "NGROK_URL=$NGROK_URL" | tee -a "$GITHUB_ENV"
-          GRAFANA_ROOT_URL="${NGROK_URL}/grafana/"
-          echo "GRAFANA_ROOT_URL=$GRAFANA_ROOT_URL" | tee -a "$GITHUB_ENV"
+          echo "GRAFANA_ROOT_URL=${NGROK_URL}/grafana/" | tee -a "$GITHUB_ENV"
           echo "::notice title=Public URL::$NGROK_URL"
 
-      - name: Write reverse proxy (Nginx) and compose override
+      - name: Write reverse proxy (Nginx) + compose override
         run: |
           cat > reverse-proxy.nginx.conf <<'NGINX'
           events {}
@@ -82,19 +78,43 @@ jobs:
               }
 
               # Grafana at /grafana/
+              location = /grafana { return 301 /grafana/; }
               location /grafana/ {
+                rewrite ^/grafana/(.*)$ /$1 break;
                 proxy_pass http://grafana:3000/;
                 proxy_http_version 1.1;
                 proxy_set_header Host $host;
                 proxy_set_header X-Real-IP $remote_addr;
                 proxy_set_header X-Forwarded-Proto $scheme;
-                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Prefix /grafana;
+                proxy_redirect off;
+              }
+
+              # Prometheus at /prometheus/
+              location = /prometheus { return 301 /prometheus/; }
+              location /prometheus/ {
+                rewrite ^/prometheus/(.*)$ /$1 break;
+                proxy_pass http://prometheus:9090/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Forwarded-Prefix /prometheus;
+                proxy_redirect off;
+              }
+
+              # Alertmanager at /alertmanager/
+              location = /alertmanager { return 301 /alertmanager/; }
+              location /alertmanager/ {
+                rewrite ^/alertmanager/(.*)$ /$1 break;
+                proxy_pass http://alertmanager:9093/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header X-Forwarded-Prefix /alertmanager;
+                proxy_redirect off;
               }
             }
           }
           NGINX
 
-          # Compose override: add reverse-proxy service and tell Grafana to serve from subpath
           cat > reverse-proxy.compose.yml <<'YML'
           services:
             reverse-proxy:
@@ -107,26 +127,36 @@ jobs:
               depends_on:
                 - api
                 - grafana
+                - prometheus
+                - alertmanager
 
             grafana:
               environment:
                 GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}
                 GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+                GF_SECURITY_ALLOW_EMBEDDING: "true"
           YML
+
+      - name: Create empty .env so Compose env_file references don’t fail
+        run: |
+          touch .env
 
       - name: Bring up stack (API + worker + db + redis + monitoring + reverse-proxy)
         env:
+          # Core / API
           ENV: ${{ env.ENV }}
           LOG_LEVEL: ${{ env.LOG_LEVEL }}
           API_HOST: ${{ env.API_HOST }}
           API_PORT: ${{ env.API_PORT }}
           APP_BASE_URL: ${{ env.NGROK_URL }}
 
+          # DB / Redis / Celery
           DATABASE_URL: ${{ env.DATABASE_URL }}
           REDIS_URL: ${{ env.REDIS_URL }}
           CELERY_BROKER_URL: ${{ env.REDIS_URL }}
           CELERY_RESULT_BACKEND: ${{ env.REDIS_URL }}
 
+          # Shopify (secrets)
           SHOPIFY_SHOP: ${{ secrets.SHOPIFY_SHOP }}
           SHOPIFY_API_VERSION: ${{ env.SHOPIFY_API_VERSION }}
           SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
@@ -138,6 +168,7 @@ jobs:
           SHOPIFY_WEBHOOK_SECRET: ${{ secrets.SHOPIFY_WEBHOOK_SECRET }}
           SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
 
+          # BC365
           BC365_BASE_URL: ${{ secrets.BC365_BASE_URL }}
           BC365_TENANT_ID: ${{ secrets.BC365_TENANT_ID }}
           BC365_ENVIRONMENT: ${{ secrets.BC365_ENVIRONMENT }}
@@ -147,11 +178,12 @@ jobs:
           BC365_DEFAULT_CUSTOMER: ${{ secrets.BC365_DEFAULT_CUSTOMER }}
           SKU_MAP_JSON: ${{ secrets.SKU_MAP_JSON }}
 
+          # Security & Observability
           ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
           PROMETHEUS_ENABLE: ${{ env.PROMETHEUS_ENABLE }}
           PROMETHEUS_WORKER_PORT: ${{ env.PROMETHEUS_WORKER_PORT }}
 
-          # from earlier step
+          # Grafana external URL (used in override)
           GRAFANA_ROOT_URL: ${{ env.GRAFANA_ROOT_URL }}
         run: |
           docker compose \
@@ -161,22 +193,30 @@ jobs:
             up -d --build
           docker ps -a
 
-      - name: Wait for API and Grafana
+      - name: Wait for public endpoints
         run: |
           echo "Waiting for API..."
-          for i in {1..120}; do curl -sf http://localhost:8000/health >/dev/null && break; sleep 2; done
-          echo "Waiting for Grafana via tunnel..."
+          for i in {1..120}; do curl -sf "${NGROK_URL}/health" >/dev/null && break; sleep 2; done
+          echo "Waiting for Grafana..."
           for i in {1..180}; do curl -sfL "${GRAFANA_ROOT_URL}login" >/dev/null && break; sleep 2; done
+          echo "Waiting for Prometheus..."
+          for i in {1..120}; do curl -sfL "${NGROK_URL}/prometheus/graph" >/dev/null && break; sleep 2; done
+          echo "Waiting for Alertmanager..."
+          for i in {1..120}; do curl -sfL "${NGROK_URL}/alertmanager/#/status" >/dev/null && break; sleep 2; done
           echo "Public API: ${NGROK_URL}"
-          echo "Grafana: ${GRAFANA_ROOT_URL}"
+          echo "Grafana:   ${GRAFANA_ROOT_URL}"
+          echo "Prometheus:${NGROK_URL}/prometheus/"
+          echo "Alerts:    ${NGROK_URL}/alertmanager/"
 
       - name: Smoke checks
         run: |
-          curl -sSf "${NGROK_URL}/metrics" | head -n 30 || true
           curl -sSf "${NGROK_URL}/health" || true
+          curl -sSf "${NGROK_URL}/metrics" | head -n 25 || true
           curl -sSfL "${GRAFANA_ROOT_URL}login" | head -n 20 || true
+          curl -sSfL "${NGROK_URL}/prometheus/graph" | head -n 20 || true
+          curl -sSfL "${NGROK_URL}/alertmanager/#/status" | head -n 20 || true
 
-      - name: Show links
+      - name: Publish links
         run: |
           {
             echo "## Public URLs"
@@ -185,10 +225,13 @@ jobs:
             echo "  - Health:  ${NGROK_URL}/health"
             echo "  - Metrics: ${NGROK_URL}/metrics"
             echo "- **Grafana**: ${GRAFANA_ROOT_URL}"
-            echo "  - Login: admin / admin (unless overridden)"
+            echo "- **Prometheus**: ${NGROK_URL}/prometheus/"
+            echo "- **Alertmanager**: ${NGROK_URL}/alertmanager/"
+            echo ""
+            echo "_Runner will stay alive until you cancel the job (max ~6h)._"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep alive for manual testing
+      - name: Keep alive for demo
         run: |
-          echo "Webhook-ready at ${NGROK_URL}. Leave running; cancel when done (max ~6h)."
+          echo "Webhook-ready at ${NGROK_URL}. Cancel when finished."
           while true; do date; sleep 60; done
