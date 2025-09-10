@@ -3,10 +3,14 @@ name: Spin Up Demo (Docker + ngrok)
 on:
   workflow_dispatch:
 
+concurrency:
+  group: spin-up-demo
+  cancel-in-progress: true
+
 jobs:
   demo:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
     env:
       # Defaults for non-secret values
       ENV: dev
@@ -40,32 +44,72 @@ jobs:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
           ngrok config add-authtoken "${NGROK_AUTHTOKEN}"
+          # create a config with two tunnels so both start together
+          mkdir -p ~/.config/ngrok
+          cat > ~/.config/ngrok/ngrok.yml <<'NG'
+          version: "2"
+          authtoken: ${NGROK_AUTHTOKEN}
+          tunnels:
+            api:
+              addr: 8000
+              proto: http
+            grafana:
+              addr: 3000
+              proto: http
+          NG
 
-      - name: Start ngrok tunnel (API :8000)
+      - name: Bring up stack (API + worker + db + redis + monitoring)
         run: |
-          # Start tunnel to local port 8000; API will be mapped there by compose
-          nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
-          # Wait for the local ngrok API to be up
+          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml up -d --build
+          docker ps -a
+
+      - name: Wait for API & Grafana to be ready
+        run: |
+          for i in {1..90}; do
+            API_OK=0
+            GRAFANA_OK=0
+
+            curl -sf http://localhost:8000/openapi.json >/dev/null && API_OK=1
+            curl -sf http://localhost:3000/login >/dev/null && GRAFANA_OK=1
+
+            if [ "$API_OK" = "1" ] && [ "$GRAFANA_OK" = "1" ]; then
+              echo "API and Grafana are up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Services failed to start in time" >&2
+          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml ps
+          exit 1
+
+      - name: Start ngrok tunnels (API :8000 & Grafana :3000)
+        run: |
+          nohup ngrok start --all --log=stdout > ngrok.log 2>&1 &
+          # wait for local ngrok API
           for i in {1..30}; do
             if curl -sSf http://127.0.0.1:4040/api/tunnels >/dev/null; then break; fi
             sleep 1
           done
-          # Grab the https public URL
-          NGROK_URL="$(curl -s http://127.0.0.1:4040/api/tunnels \
-            | jq -r '.tunnels[] | select(.proto=="https") | .public_url' | head -n1)"
-          echo "NGROK_URL=$NGROK_URL" | tee -a $GITHUB_ENV
-          echo "::notice title=Public URL::$NGROK_URL"
+          # capture URLs
+          NGROK_API_URL="$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.name=="api") | .public_url')"
+          NGROK_GRAFANA_URL="$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[] | select(.name=="grafana") | .public_url')"
 
-      - name: Generate .env for containers
+          echo "NGROK_API_URL=$NGROK_API_URL" | tee -a $GITHUB_ENV
+          echo "NGROK_GRAFANA_URL=$NGROK_GRAFANA_URL" | tee -a $GITHUB_ENV
+
+          echo "::notice title=API URL::$NGROK_API_URL"
+          echo "::notice title=Grafana URL::$NGROK_GRAFANA_URL"
+
+      - name: Generate .env for containers (with APP_BASE_URL)
         env:
           # Core / API
           ENV: ${{ env.ENV }}
           LOG_LEVEL: ${{ env.LOG_LEVEL }}
           API_HOST: ${{ env.API_HOST }}
           API_PORT: ${{ env.API_PORT }}
-          APP_BASE_URL: ${{ env.NGROK_URL }}
+          APP_BASE_URL: ${{ env.NGROK_API_URL }}
 
-          # DB (leave host as service name "db" from compose)
+          # DB (service name "db" in compose)
           DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/shopify
 
           # Redis / Celery
@@ -134,8 +178,6 @@ jobs:
           BC365_CLIENT_SECRET=${BC365_CLIENT_SECRET}
           BC365_COMPANY_ID=${BC365_COMPANY_ID}
           BC365_DEFAULT_CUSTOMER=${BC365_DEFAULT_CUSTOMER}
-
-          # Quote JSON so special chars survive shell/env parsing
           SKU_MAP_JSON='${SKU_MAP_JSON}'
 
           ADMIN_API_TOKEN=${ADMIN_API_TOKEN}
@@ -144,64 +186,53 @@ jobs:
           PROMETHEUS_WORKER_PORT=${PROMETHEUS_WORKER_PORT}
           EOF
 
-      - name: Bring up stack (API + worker + db + redis + monitoring)
-        run: |
-          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml up -d --build
-          docker ps -a
+          echo "Wrote .env:"
+          sed -e 's/\(CLIENT_SECRET=\).*/\1****/g' \
+              -e 's/\(ACCESS_TOKEN=\).*/\1****/g' \
+              -e 's/\(API_PASSWORD=\).*/\1****/g' .env
 
-      - name: Wait for API to be ready
+      - name: Quick smoke check
         run: |
-          # prefer local loopback to avoid ngrok rate limits during warm-up
-          for i in {1..60}; do
-            if curl -sSf http://localhost:8000/openapi.json >/dev/null; then
-              echo "API is up"; exit 0
-            fi
-            sleep 2
-          done
-          echo "API failed to start in time" >&2
-          docker compose ps
-          exit 1
+          curl -fsS http://localhost:8000/health || true
+          curl -fsS http://localhost:8000/metrics | head -n 50 || true
 
-      - name: Quick smoke check (debug endpoints present)
+      - name: Publish URLs to job summary
         run: |
-          curl -f http://localhost:8000/debug/inventory/locations || true
-          curl -f http://localhost:8000/metrics | head -n 40 || true
+          {
+            echo "## Live Demo URLs"
+            echo ""
+            echo "- **API**: ${{ env.NGROK_API_URL }}"
+            echo "  - Swagger: ${{ env.NGROK_API_URL }}/docs"
+            echo "  - Health:  ${{ env.NGROK_API_URL }}/health"
+            echo "  - Metrics: ${{ env.NGROK_API_URL }}/metrics"
+            echo ""
+            echo "- **Grafana**: ${{ env.NGROK_GRAFANA_URL }}"
+            echo "  - Login page: ${{ env.NGROK_GRAFANA_URL }}/login (default admin/admin if unchanged)"
+            echo ""
+            echo "### Shopify webhook base"
+            echo "Use \`${{ env.NGROK_API_URL }}\` as your webhook base URL, e.g.:"
+            echo "- Orders Create: \`${{ env.NGROK_API_URL }}/webhooks/shopify/orders/create\`"
+            echo "- App Uninstalled: \`${{ env.NGROK_API_URL }}/webhooks/shopify/app/uninstalled\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Show public URL (bookmark this for testing)
-        run: |
-          echo "::notice title=Demo URL::${NGROK_URL}"
-          echo "Demo URL: ${NGROK_URL}"
-
-      - name: Upload logs (always)
-        if: always()
+      - name: Upload logs (ngrok + compose files)
         uses: actions/upload-artifact@v4
         with:
-          name: demo-logs
+          name: demo-boot-logs
           path: |
             ngrok.log
             docker-compose.yml
             monitoring/docker-compose.addon.yml
 
-      - name: Dump container logs (on failure)
-        if: failure()
+      # Keep running so the ngrok URLs stay alive for webhooks during the demo
+      - name: Keep alive until cancelled (max ~6h)
         run: |
-          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml logs --no-color > docker-logs.txt
-          gzip docker-logs.txt
-          echo "Container logs archived."
+          echo "Demo running. Public URLs:"
+          echo "API:     $NGROK_API_URL"
+          echo "Grafana: $NGROK_GRAFANA_URL"
+          echo "Press 'Cancel workflow' when you're done."
+          # trap to print a final note on cancel
+          trap 'echo "Shutting down demo runner..."' TERM INT
+          while true; do sleep 60; done
 
-      - name: Upload container logs (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-logs
-          path: docker-logs.txt.gz
-
-      # Optional: keep running for manual testing
-      # Comment out if you just want to prove it boots and then tear down.
-      - name: Keep alive for manual testing (15 min)
-        run: sleep 900
-
-      - name: Tear down stack (always)
-        if: always()
-        run: |
-          docker compose -f docker-compose.yml -f monitoring/docker-compose.addon.yml down -v
+      # Intentionally no teardown: containers die when the runner stops/cancels
